@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import json
+import shutil
 import subprocess
 import traceback
 
@@ -52,11 +53,12 @@ def download_model():
 
 def start_server(model_path):
     cmd = [
-        "llama-server", "-m", model_path,
+        shutil.which("llama-server") or "/app/llama-server", "-m", model_path,
         "--host", "127.0.0.1", "--port", str(LLAMA_PORT),
         "-ngl", NGL, "-c", CTX,
         "--parallel", PARALLEL, "--cont-batching",
-        "--flash-attn",  # Gemma-4 sliding-window: cheap KV, keep flash attn on
+        # flash-attn defaults to 'auto' in this build; the bare flag now expects
+        # a value (on|off|auto), so we rely on the default and don't pass it.
     ]
     log("[boot] launching:", " ".join(cmd))
     proc = subprocess.Popen(cmd)

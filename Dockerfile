@@ -11,6 +11,11 @@
 # NOTE: pin the base image to a digest once it builds clean. Tag may drift.
 FROM ghcr.io/ggml-org/llama.cpp:full-cuda
 
+# The base image keeps its binaries in /app (WORKDIR) and its ENTRYPOINT is a
+# dispatcher (/app/tools.sh) — /app is NOT on PATH. We reset the entrypoint and
+# call llama-server ourselves, so put /app on PATH or the handler can't find it.
+ENV PATH="/app:${PATH}"
+
 # Python + RunPod SDK + HF downloader on top of the llama.cpp image.
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
