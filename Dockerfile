@@ -27,9 +27,7 @@ ENV MODEL_REPO=BeaverAI/Artemis-31B-v1i-GGUF \
     CTX_SIZE=32768 \
     GPU_LAYERS=999 \
     PARALLEL=4 \
-    LLAMA_PORT=8080 \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
-    MODEL_DIR=/models
+    LLAMA_PORT=8080
 
 # HF_TOKEN is set as a RunPod *secret* (needed only if the repo is private).
 # The GGUF is downloaded on first boot into a volume/local dir (see README:

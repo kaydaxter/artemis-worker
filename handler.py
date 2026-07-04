@@ -1,16 +1,15 @@
 """
 RunPod Serverless handler for Artemis-31B-v1i (Q8_0 GGUF) via llama.cpp.
 
-Speaks the EXACT contract vaelico-web/app expects (see app/src/routes/chat.js):
-  input  = { "messages": [...], "sampling_params": {...}, "stream": bool }
-  output (non-stream) = { "text": str, "usage": {"prompt_tokens","completion_tokens"} }
-  output (stream)     = a sequence of raw string pieces (one yield per token chunk)
+Speaks the contract vaelico-web/app expects (app/src/routes/chat.js):
+  input  = { "messages":[...], "sampling_params":{...}, "stream":bool }
+  output (non-stream) = { "text":str, "usage":{prompt_tokens,completion_tokens} }
+  output (stream)     = raw string pieces (one yield per token chunk)
 
-The gateway calls /runsync (stream:false) -> aggregated list -> unwrap()[0].text,
-and /run + /stream (stream:true) -> each yielded string is item.output.
-
-Defensive extras (learned the hard way): print tracebacks and sleep before dying
-so RunPod's log collector captures the cause of a fast crash.
+Boot (model download + llama-server) runs in a BACKGROUND THREAD so the worker
+becomes healthy immediately instead of crash-looping. If boot fails, the first
+job returns the traceback via /status — RunPod worker logs aren't reachable with
+an API key (runpod-python#400), so this is how we surface the real error.
 """
 import os
 import sys
@@ -18,6 +17,7 @@ import time
 import json
 import shutil
 import subprocess
+import threading
 import traceback
 
 import requests
@@ -27,7 +27,6 @@ LLAMA_PORT = int(os.environ.get("LLAMA_PORT", "8080"))
 BASE = f"http://127.0.0.1:{LLAMA_PORT}"
 MODEL_REPO = os.environ.get("MODEL_REPO", "BeaverAI/Artemis-31B-v1i-GGUF")
 MODEL_FILE = os.environ.get("MODEL_FILE", "Artemis-31B-v1i-Q8_0.gguf")
-MODEL_DIR = os.environ.get("MODEL_DIR", "/models")
 CTX = os.environ.get("CTX_SIZE", "32768")
 NGL = os.environ.get("GPU_LAYERS", "999")
 PARALLEL = os.environ.get("PARALLEL", "4")
@@ -39,30 +38,21 @@ def log(*a):
 
 def download_model():
     from huggingface_hub import hf_hub_download
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    log(f"[boot] downloading {MODEL_REPO}/{MODEL_FILE} -> {MODEL_DIR}")
-    path = hf_hub_download(
-        repo_id=MODEL_REPO,
-        filename=MODEL_FILE,
-        local_dir=MODEL_DIR,
-        token=os.environ.get("HF_TOKEN"),
-    )
-    log(f"[boot] model ready at {path}")
-    return path
+    log(f"[boot] downloading {MODEL_REPO}/{MODEL_FILE}")
+    # No local_dir: keep a single copy in the HF cache (avoids two 30GB copies
+    # that would blow the container disk).
+    p = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE, token=os.environ.get("HF_TOKEN"))
+    log(f"[boot] model at {p}")
+    return p
 
 
 def start_server(model_path):
-    cmd = [
-        shutil.which("llama-server") or "/app/llama-server", "-m", model_path,
-        "--host", "127.0.0.1", "--port", str(LLAMA_PORT),
-        "-ngl", NGL, "-c", CTX,
-        "--parallel", PARALLEL, "--cont-batching",
-        # flash-attn defaults to 'auto' in this build; the bare flag now expects
-        # a value (on|off|auto), so we rely on the default and don't pass it.
-    ]
+    binp = shutil.which("llama-server") or "/app/llama-server"
+    cmd = [binp, "-m", model_path, "--host", "127.0.0.1", "--port", str(LLAMA_PORT),
+           "-ngl", NGL, "-c", CTX, "--parallel", PARALLEL, "--cont-batching"]
     log("[boot] launching:", " ".join(cmd))
     proc = subprocess.Popen(cmd)
-    for _ in range(900):  # up to ~15 min for a cold weight load
+    for _ in range(1200):
         try:
             if requests.get(f"{BASE}/health", timeout=2).status_code == 200:
                 log("[boot] llama-server healthy")
@@ -70,20 +60,29 @@ def start_server(model_path):
         except Exception:
             pass
         if proc.poll() is not None:
-            raise RuntimeError(f"llama-server exited early (code {proc.returncode})")
+            raise RuntimeError(f"llama-server exited early with code {proc.returncode}")
         time.sleep(1)
-    raise RuntimeError("llama-server never became healthy")
+    raise RuntimeError("llama-server never became healthy in time")
 
 
-# --- boot once at module load (before RunPod starts handing us jobs) ---
-try:
-    _model_path = download_model()
-    _server = start_server(_model_path)
-except Exception:
-    log("[boot] FATAL:")
-    log(traceback.format_exc())
-    time.sleep(60)  # let the log collector catch it before the worker dies
-    raise
+BOOT_ERROR = None
+READY = threading.Event()
+
+
+def _boot():
+    global BOOT_ERROR
+    try:
+        start_server(download_model())
+    except Exception:
+        BOOT_ERROR = traceback.format_exc()
+        log("[boot] FAILED:\n" + BOOT_ERROR)
+    finally:
+        READY.set()
+
+
+# Boot in the background so serverless.start() runs immediately (worker healthy)
+# and a boot failure is reported on the first job rather than crash-looping.
+threading.Thread(target=_boot, daemon=True).start()
 
 
 def _payload(inp):
@@ -92,7 +91,6 @@ def _payload(inp):
         "messages": inp.get("messages", []),
         "max_tokens": sp.get("max_tokens", 1024),
         "temperature": sp.get("temperature", 0.8),
-        # TheDrummer's recommended default for Artemis; harmless if overridden.
         "repeat_penalty": sp.get("repeat_penalty", 1.1),
     }
     for k in ("top_p", "seed", "stop"):
@@ -102,13 +100,16 @@ def _payload(inp):
 
 
 def handler(job):
+    READY.wait()
+    if BOOT_ERROR:
+        yield {"error": "worker boot failed", "traceback": BOOT_ERROR[-3500:]}
+        return
     inp = job.get("input", {}) or {}
     payload = _payload(inp)
     try:
         if inp.get("stream"):
             payload["stream"] = True
-            with requests.post(f"{BASE}/v1/chat/completions", json=payload,
-                               stream=True, timeout=900) as r:
+            with requests.post(f"{BASE}/v1/chat/completions", json=payload, stream=True, timeout=900) as r:
                 r.raise_for_status()
                 for raw in r.iter_lines():
                     if not raw:
@@ -124,7 +125,7 @@ def handler(job):
                     except Exception:
                         continue
                     if piece:
-                        yield piece  # gateway reads this as item.output (string)
+                        yield piece
         else:
             r = requests.post(f"{BASE}/v1/chat/completions", json=payload, timeout=900)
             r.raise_for_status()
@@ -138,11 +139,8 @@ def handler(job):
                 },
             }
     except Exception:
-        log("[handler] generation error:")
-        log(traceback.format_exc())
+        log("[handler] error:\n" + traceback.format_exc())
         yield {"error": "generation failed on the worker"}
 
 
-# return_aggregate_stream: /runsync returns the list of yields, so a single
-# non-stream yield becomes output=[{text,usage}] -> gateway's unwrap()[0]. Match.
 runpod.serverless.start({"handler": handler, "return_aggregate_stream": True})
