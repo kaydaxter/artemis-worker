@@ -11,10 +11,13 @@
 # NOTE: pin the base image to a digest once it builds clean. Tag may drift.
 FROM ghcr.io/ggml-org/llama.cpp:full-cuda
 
-# The base image keeps its binaries in /app (WORKDIR) and its ENTRYPOINT is a
-# dispatcher (/app/tools.sh) — /app is NOT on PATH. We reset the entrypoint and
-# call llama-server ourselves, so put /app on PATH or the handler can't find it.
+# The base image keeps binaries AND their shared libs in /app (WORKDIR); its
+# ENTRYPOINT is a dispatcher (/app/tools.sh) that sets these up. We reset the
+# entrypoint and call llama-server ourselves, so /app must be on PATH (find the
+# binary) AND on LD_LIBRARY_PATH (find libllama-server-impl.so etc.) — without
+# the latter, llama-server dies with exit 127 "cannot open shared object file".
 ENV PATH="/app:${PATH}"
+ENV LD_LIBRARY_PATH="/app:${LD_LIBRARY_PATH}"
 
 # Python + RunPod SDK + HF downloader on top of the llama.cpp image.
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip \
@@ -37,4 +40,4 @@ COPY handler.py /handler.py
 
 # The llama.cpp base image sets its own ENTRYPOINT; reset it so our handler runs.
 ENTRYPOINT []
-CMD ["python3", "/handler.py"]
+CMD ["python3", "-u", "/handler.py"]
