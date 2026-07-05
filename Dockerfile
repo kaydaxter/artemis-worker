@@ -32,6 +32,12 @@ ENV MODEL_REPO=BeaverAI/Artemis-31B-v1i-GGUF \
     PARALLEL=4 \
     LLAMA_PORT=8080
 
+# Gemma 4 defaults to *thinking* mode: the reply lands in reasoning_content and
+# `text` comes back empty. Bake the off-switch into the image so a redeploy
+# can't forget it (the RunPod template sets these too, but that step is manual).
+ENV LLAMA_ARG_THINK_BUDGET=0 \
+    LLAMA_ARG_REASONING=off
+
 # HF_TOKEN is set as a RunPod *secret* (needed only if the repo is private).
 # The GGUF is downloaded on first boot into a volume/local dir (see README:
 # bake it into the image later if cold-start download hurts).
