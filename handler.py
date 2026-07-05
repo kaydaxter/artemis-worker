@@ -88,6 +88,17 @@ def _req(path, body):
         headers={"Content-Type": "application/json"}, method="POST")
 
 
+# Samplers que llama-server acepta en /v1/chat/completions — passthrough completo
+# (el gateway ya los sanea; ver SAMPLER_NUM_KEYS en app/src/routes/chat.js).
+_SAMPLER_KEYS = {
+    "top_p", "top_k", "min_p", "typical_p", "seed",
+    "presence_penalty", "frequency_penalty", "repeat_penalty", "repeat_last_n",
+    "dry_multiplier", "dry_base", "dry_allowed_length", "dry_penalty_last_n",
+    "dry_sequence_breakers", "xtc_probability", "xtc_threshold", "top_n_sigma",
+    "mirostat", "mirostat_tau", "mirostat_eta", "logit_bias", "stop",
+}
+
+
 def _build_body(inp):
     sp = inp.get("sampling_params", {}) or {}
     body = {
@@ -96,12 +107,9 @@ def _build_body(inp):
         "temperature": float(sp.get("temperature", 0.8)),
         "repeat_penalty": float(sp.get("repeat_penalty", 1.1)),
     }
-    if sp.get("top_p") is not None:
-        body["top_p"] = float(sp["top_p"])
-    if sp.get("seed") is not None:
-        body["seed"] = int(sp["seed"])
-    if sp.get("stop") is not None:
-        body["stop"] = sp["stop"]
+    for k, v in sp.items():
+        if k in _SAMPLER_KEYS and v is not None:
+            body[k] = v
     return body
 
 
