@@ -121,7 +121,8 @@ def handler(job):
                     if payload == "[DONE]":
                         break
                     try:
-                        delta = json.loads(payload)["choices"][0].get("delta", {}).get("content") or ""
+                        d = json.loads(payload)["choices"][0].get("delta", {})
+                        delta = d.get("content") or d.get("reasoning_content") or ""
                     except Exception:
                         continue
                     if delta:
@@ -129,7 +130,17 @@ def handler(job):
         else:
             with urllib.request.urlopen(_req("/v1/chat/completions", body), timeout=900) as r:
                 out = json.loads(r.read().decode())
-            yield {"text": out["choices"][0]["message"]["content"], "usage": out.get("usage")}
+            msg = out["choices"][0]["message"]
+            content = msg.get("content")
+            if isinstance(content, list):  # content parts -> join text
+                content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+            if not content:  # some templates put it in reasoning_content
+                content = msg.get("reasoning_content") or ""
+            result = {"text": content or "", "usage": out.get("usage")}
+            if not content:  # diagnostic: expose the raw shape so we see the field
+                result["_debug_msg"] = json.dumps(msg)[:700]
+                result["_finish"] = out["choices"][0].get("finish_reason")
+            yield result
     except urllib.error.HTTPError as e:
         yield {"error": f"HTTP {e.code}", "body": e.read().decode()[:800]}
     except Exception as e:
