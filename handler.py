@@ -10,9 +10,11 @@ contenido de usuario en logs). Cambios v4 para Artemis:
   repetition_penalty; top_k 0 = desactivado se omite). Los exoticos de
   llama.cpp (DRY/XTC/mirostat) se descartan aqui: vLLM no los tiene.
 - PREFILL: si el ultimo mensaje es del assistant ("Start Reply With" de
-  SillyTavern), se manda add_generation_prompt=false +
-  continue_final_message=true para que vLLM CONTINUE ese turno en vez de
-  abrir uno nuevo (llama-server lo hacia solo; vLLM lo pide explicito).
+  SillyTavern), la continuacion se construye via /tokenize (prompt de chat
+  con add_generation_prompt, que incluye el bloque de thought vacio del
+  template gemma4) + tokens del prefill -> /v1/completions con token ids.
+  OJO: continue_final_message NO sirve aqui — omite el bloque de thought y
+  el modelo degenera (medido en produccion).
 
 Contrato con la app (app/src/routes/chat.js), sin cambios:
 input {messages|prompt, sampling_params, stream} ->
@@ -129,15 +131,46 @@ def _build_body(inp):
 
     if "messages" in inp:
         msgs = inp["messages"]
-        body["messages"] = msgs
-        # Prefill de assistant (Start Reply With): continuar el turno final.
+        # Prefill de assistant (Start Reply With): NO usar continue_final_message
+        # — el template de gemma4 abre cada turno del modelo con el bloque de
+        # thought vacio (<|channel>thought\n<channel|>) SOLO en la rama
+        # add_generation_prompt; continue_final_message lo omite y el modelo
+        # queda fuera de distribucion (babea; medido). En su lugar: renderizar
+        # el prompt SIN el mensaje final via /tokenize (que si mete el bloque),
+        # concatenar los tokens del prefill y continuar por /v1/completions.
         if msgs and (msgs[-1] or {}).get("role") == "assistant":
-            body["add_generation_prompt"] = False
-            body["continue_final_message"] = True
+            prefill = (msgs[-1] or {}).get("content") or ""
+            ids = _tokenize_chat(msgs[:-1])
+            ids += _tokenize_text(prefill)
+            comp = {k: v for k, v in body.items()}
+            comp["prompt"] = ids
+            # eos del chat: <turn|> etc. (generation_config: [1, 106, 50]).
+            comp["stop_token_ids"] = [1, 106, 50]
+            return "/v1/completions", comp, False
+        body["messages"] = msgs
         return "/v1/chat/completions", body, True
     if "prompt" in inp:
         return "/v1/completions", {**body, "prompt": inp["prompt"]}, False
     return None, None, None
+
+
+def _tokenize_chat(messages):
+    """Tokens del prompt de chat con add_generation_prompt (incluye el bloque
+    de thought vacio que el modelo espera al abrir su turno)."""
+    req = _req("/tokenize", {"model": "artemis", "messages": messages,
+                             "add_generation_prompt": True})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode())["tokens"]
+
+
+def _tokenize_text(text):
+    """Tokens de texto crudo, sin BOS ni especiales (cola del prefill)."""
+    if not text:
+        return []
+    req = _req("/tokenize", {"model": "artemis", "prompt": text,
+                             "add_special_tokens": False})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode())["tokens"]
 
 
 def _iter_sse(path, body, chat):
