@@ -1,19 +1,32 @@
-"""Worker RunPod serverless: Artemis-31B-v1i (Gemma 4) via llama.cpp / GGUF.
+"""Worker RunPod serverless: Artemis-31B-v1i (Gemma 4) via vLLM 0.24. v4.
 
-Mirrors the proven qwen35-worker-vllm pattern: blocking boot, flushed logs,
-fatal() that sleeps 60s so the log is captured. Speaks the contract the app
-expects (app/src/routes/chat.js): input {messages, sampling_params, stream} ->
-non-stream {text, usage}; stream -> raw string pieces.
+Base: el patron probado de qwen35-worker-vllm v3 (boot bloqueante, logs con
+flush, fatal() que duerme 60s para que el log se capture, higiene: cero
+contenido de usuario en logs). Cambios v4 para Artemis:
+
+- SAMPLERS: passthrough del kit que vLLM implementa (top_p, top_k, min_p,
+  presence/frequency/repetition_penalty, seed, stop, logit_bias) aceptando
+  ademas el dialecto llama.cpp del gateway (repeat_penalty ->
+  repetition_penalty; top_k 0 = desactivado se omite). Los exoticos de
+  llama.cpp (DRY/XTC/mirostat) se descartan aqui: vLLM no los tiene.
+- PREFILL: si el ultimo mensaje es del assistant ("Start Reply With" de
+  SillyTavern), se manda add_generation_prompt=false +
+  continue_final_message=true para que vLLM CONTINUE ese turno en vez de
+  abrir uno nuevo (llama-server lo hacia solo; vLLM lo pide explicito).
+
+Contrato con la app (app/src/routes/chat.js), sin cambios:
+input {messages|prompt, sampling_params, stream} ->
+non-stream: {text, usage} · stream: piezas de texto crudas.
 """
 import json
 import os
-import shutil
+import shlex
 import subprocess
 import sys
 import time
 import traceback
 
-print("[worker] handler.py arrancando (python OK)", flush=True)
+print("[worker] handler.py v4 (vLLM) arrancando (python OK)", flush=True)
 
 
 def fatal(msg, exc=True):
@@ -29,45 +42,43 @@ try:
     import urllib.request
     import urllib.error
     import runpod
-    from huggingface_hub import hf_hub_download
     print("[worker] imports OK (runpod %s)" % getattr(runpod, "__version__", "?"), flush=True)
 except Exception:
     fatal("fallo importando dependencias")
 
-MODEL_REPO = os.environ.get("MODEL_REPO", "BeaverAI/Artemis-31B-v1i-GGUF")
-MODEL_FILE = os.environ.get("MODEL_FILE", "Artemis-31B-v1i-Q8_0.gguf")
-PORT = "8080"
+MODEL = os.environ.get("MODEL_NAME", "TigerKay/Artemis-31B-v1i-fp8")
+PORT = "8000"
 BASE = f"http://127.0.0.1:{PORT}"
-LLAMA_BIN = shutil.which("llama-server") or "/app/llama-server"
-
-print(f"[worker] descargando {MODEL_REPO}/{MODEL_FILE} ...", flush=True)
-try:
-    # single copy in the HF cache (no local_dir) to avoid two 30GB copies
-    MODEL_PATH = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE,
-                                 token=os.environ.get("HF_TOKEN"))
-    print(f"[worker] modelo en {MODEL_PATH}", flush=True)
-except Exception:
-    fatal("descarga del GGUF fallo")
 
 cmd = [
-    LLAMA_BIN, "-m", MODEL_PATH,
+    "python3", "-m", "vllm.entrypoints.openai.api_server",
+    "--model", MODEL,
+    "--served-model-name", "artemis",
     "--host", "127.0.0.1", "--port", PORT,
-    "-ngl", os.environ.get("GPU_LAYERS", "999"),
-    "-c", os.environ.get("CTX_SIZE", "32768"),
-    "--parallel", os.environ.get("PARALLEL", "4"),
-    "--cont-batching",
+    "--dtype", os.environ.get("DTYPE", "bfloat16"),
+    "--max-model-len", os.environ.get("MAX_MODEL_LEN", "65536"),
+    # 0.95: con 0.93 el KV en 48GB queda por debajo de lo que exige una
+    # peticion de 64k y vLLM 0.24 no arranca (medido en el pod L40S).
+    "--gpu-memory-utilization", os.environ.get("GPU_MEMORY_UTILIZATION", "0.95"),
 ]
-print("[worker] lanzando llama-server: %s" % " ".join(cmd), flush=True)
+extra = os.environ.get("VLLM_EXTRA_ARGS", "").strip()
+if extra:
+    try:
+        cmd += shlex.split(extra)
+    except Exception:
+        fatal(f"VLLM_EXTRA_ARGS no parsea: {extra!r}")
+
+print("[worker] lanzando vLLM (modelo: %s)" % MODEL, flush=True)
 t0 = time.time()
 try:
     proc = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
 except Exception:
-    fatal("Popen de llama-server fallo")
+    fatal("Popen de vllm fallo")
 
 while True:
     rc = proc.poll()
     if rc is not None:
-        fatal(f"llama-server murio en el arranque con exit code {rc} "
+        fatal(f"vllm murio en el arranque con exit code {rc} "
               f"(a los {time.time()-t0:.0f}s) — su error debe estar arriba", exc=False)
     try:
         with urllib.request.urlopen(f"{BASE}/health", timeout=5) as r:
@@ -76,79 +87,98 @@ while True:
     except Exception:
         pass
     el = int(time.time() - t0)
-    if el and el % 30 < 2:
-        print(f"[worker] esperando a llama-server... {el}s", flush=True)
+    if el and el % 60 < 2:
+        print(f"[worker] esperando a vLLM... {el}s", flush=True)
     time.sleep(2)
-print(f"[worker] llama-server LISTO en {time.time()-t0:.1f}s", flush=True)
+print(f"[worker] vLLM LISTO en {time.time()-t0:.1f}s", flush=True)
 
 
-def _req(path, body):
+def _req(path, body, timeout=900):
     return urllib.request.Request(
         f"{BASE}{path}", data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
 
 
-# Samplers que llama-server acepta en /v1/chat/completions — passthrough completo
-# (el gateway ya los sanea; ver SAMPLER_NUM_KEYS en app/src/routes/chat.js).
-_SAMPLER_KEYS = {
-    "top_p", "top_k", "min_p", "typical_p", "seed",
-    "presence_penalty", "frequency_penalty", "repeat_penalty", "repeat_last_n",
-    "dry_multiplier", "dry_base", "dry_allowed_length", "dry_penalty_last_n",
-    "dry_sequence_breakers", "xtc_probability", "xtc_threshold", "top_n_sigma",
-    "mirostat", "mirostat_tau", "mirostat_eta", "logit_bias", "stop",
-}
+# Claves numericas float que vLLM acepta tal cual en /v1/chat/completions.
+_FLOAT_KEYS = ("top_p", "min_p", "presence_penalty", "frequency_penalty",
+               "repetition_penalty")
 
 
 def _build_body(inp):
     sp = inp.get("sampling_params", {}) or {}
     body = {
-        "messages": inp.get("messages", []),
-        "max_tokens": int(sp.get("max_tokens", 1024)),
-        "temperature": float(sp.get("temperature", 0.8)),
-        "repeat_penalty": float(sp.get("repeat_penalty", 1.1)),
+        "model": "artemis",
+        "max_tokens": int(sp.get("max_tokens", 256)),
+        "temperature": float(sp.get("temperature", 0.7)),
     }
-    for k, v in sp.items():
-        if k in _SAMPLER_KEYS and v is not None:
-            body[k] = v
-    return body
+    for k in _FLOAT_KEYS:
+        if sp.get(k) is not None:
+            body[k] = float(sp[k])
+    # Dialecto llama.cpp del gateway: repeat_penalty -> repetition_penalty.
+    if sp.get("repeat_penalty") is not None and "repetition_penalty" not in body:
+        body["repetition_penalty"] = float(sp["repeat_penalty"])
+    # top_k: llama.cpp usa 0 = off; vLLM exige >=1 (su off es -1) -> se omite.
+    if sp.get("top_k") is not None and int(sp["top_k"]) >= 1:
+        body["top_k"] = int(sp["top_k"])
+    if sp.get("seed") is not None:
+        body["seed"] = int(sp["seed"])
+    if sp.get("stop") is not None:
+        body["stop"] = sp["stop"]
+    if sp.get("logit_bias") is not None:
+        body["logit_bias"] = sp["logit_bias"]
+
+    if "messages" in inp:
+        msgs = inp["messages"]
+        body["messages"] = msgs
+        # Prefill de assistant (Start Reply With): continuar el turno final.
+        if msgs and (msgs[-1] or {}).get("role") == "assistant":
+            body["add_generation_prompt"] = False
+            body["continue_final_message"] = True
+        return "/v1/chat/completions", body, True
+    if "prompt" in inp:
+        return "/v1/completions", {**body, "prompt": inp["prompt"]}, False
+    return None, None, None
+
+
+def _iter_sse(path, body, chat):
+    body = {**body, "stream": True}
+    with urllib.request.urlopen(_req(path, body), timeout=900) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload == "[DONE]":
+                break
+            try:
+                ch = json.loads(payload)["choices"][0]
+                delta = (ch.get("delta", {}).get("content") if chat
+                         else ch.get("text")) or ""
+            except Exception:
+                continue
+            if delta:
+                yield delta
 
 
 def handler(job):
-    """Generator: stream=True -> yield text deltas; stream=False -> one {text,usage}."""
+    """Generador (RunPod detecta streaming por is_generator(handler)).
+    stream=True -> yield de deltas de texto.
+    stream=False -> yield unico con el resultado completo (output = [dict])."""
     inp = (job or {}).get("input", {}) or {}
-    body = _build_body(inp)
+    path, body, chat = _build_body(inp)
+    if path is None:
+        yield {"error": "input necesita 'messages' o 'prompt'"}
+        return
     try:
         if inp.get("stream"):
-            body = {**body, "stream": True}
-            with urllib.request.urlopen(_req("/v1/chat/completions", body), timeout=900) as resp:
-                for raw in resp:
-                    line = raw.decode("utf-8", "replace").strip()
-                    if not line.startswith("data: "):
-                        continue
-                    payload = line[6:]
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        d = json.loads(payload)["choices"][0].get("delta", {})
-                        delta = d.get("content") or d.get("reasoning_content") or ""
-                    except Exception:
-                        continue
-                    if delta:
-                        yield delta
+            for delta in _iter_sse(path, body, chat):
+                yield delta
         else:
-            with urllib.request.urlopen(_req("/v1/chat/completions", body), timeout=900) as r:
+            with urllib.request.urlopen(_req(path, body), timeout=900) as r:
                 out = json.loads(r.read().decode())
-            msg = out["choices"][0]["message"]
-            content = msg.get("content")
-            if isinstance(content, list):  # content parts -> join text
-                content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-            if not content:  # some templates put it in reasoning_content
-                content = msg.get("reasoning_content") or ""
-            result = {"text": content or "", "usage": out.get("usage")}
-            if not content:  # diagnostic: expose the raw shape so we see the field
-                result["_debug_msg"] = json.dumps(msg)[:700]
-                result["_finish"] = out["choices"][0].get("finish_reason")
-            yield result
+            text = (out["choices"][0]["message"]["content"] if chat
+                    else out["choices"][0]["text"])
+            yield {"text": text, "usage": out.get("usage")}
     except urllib.error.HTTPError as e:
         yield {"error": f"HTTP {e.code}", "body": e.read().decode()[:800]}
     except Exception as e:
