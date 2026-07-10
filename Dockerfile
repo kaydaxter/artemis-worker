@@ -18,5 +18,8 @@ RUN pip install --no-cache-dir runpod \
  && python3 -c "import runpod; print('[build] runpod OK')"
 
 COPY handler.py /handler.py
+# Modo load-balancer (HTTP directo, sin cola): el template LB lo activa con
+# dockerArgs `python3 -u /lb_server.py`. El CMD por defecto sigue siendo la cola.
+COPY lb_server.py /lb_server.py
 
 CMD ["python3", "-u", "/handler.py"]
